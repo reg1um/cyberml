@@ -3,4 +3,19 @@ name = "cyberml"
 version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "art>=6.5",
+    "foolbox>=3.3.4",
+    "imbalanced-learn>=0.14.0",
+    "ipykernel>=7.1.0",
+    "lightgbm>=4.6.0",
+    "matplotlib>=3.10.7",
+    "nbformat>=5.10.4",
+    "numpy>=2.3.5",
+    "pandas>=2.3.3",
+    "plotly>=6.5.0",
+    "scikit-learn>=1.7.2",
+    "seaborn>=0.13.2",
+    "tensorflow>=2.20.0",
+    "xgboost>=3.1.2",
+]
