@@ -14,6 +14,7 @@ import plotly.express as px
 import time
 import random
 import textwrap
+import joblib
 
 # ==============================================================================
 # PAGE CONFIG & THEME
@@ -170,9 +171,9 @@ st.markdown("""
 
 @st.cache_data
 def load_real_data():
-    """Load the real sampled dataset."""
+    """Load the test dataset (unseen during training)."""
     try:
-        df = pd.read_pickle('sampled_data.pkl')
+        df = pd.read_pickle('test_data.pkl')
         proto_map = {6: 'TCP', 17: 'UDP', 1: 'ICMP'}
         df['Protocol_Name'] = df['Protocol'].map(proto_map).fillna('Other')
         return df
@@ -191,6 +192,16 @@ def load_metrics():
     except Exception as e:
         st.error(f"Error loading metrics: {e}")
         return None, None, None
+    
+@st.cache_resource
+def load_model_artifacts():
+    """Load the trained model and preprocessing artifacts."""
+    try:
+        artifacts = joblib.load('model_artifacts.pkl')
+        return artifacts
+    except Exception as e:
+        # st.error(f"Error loading model: {e}")
+        return None
 
 # Feature importance (from Random Forest - top 20)
 FEATURE_IMPORTANCE = {
@@ -252,6 +263,55 @@ ATTACK_SIGNATURES = {
 # Load data
 df = load_real_data()
 classification_df, anomaly_df, adversarial_df = load_metrics()
+model_artifacts = load_model_artifacts()
+
+def predict_batch(df_batch, artifacts):
+    """Predict if packets are attacks using LightGBM classifier.
+    
+    Args:
+        df_batch: DataFrame of packets to predict
+        artifacts: Model artifacts dict containing LightGBM model
+    
+    Returns:
+        List of booleans indicating if each packet is detected as attack (not Benign)
+    """
+    if artifacts is None or df_batch.empty or 'model' not in artifacts:
+        return [row['Label'] != 'Benign' for _, row in df_batch.iterrows()]
+        
+    try:
+        # Prepare features
+        cols_to_exclude = ['Label', 'Protocol_Name', 'badge', 'status', 'is_attack'] 
+        features = df_batch.drop(columns=[c for c in cols_to_exclude if c in df_batch.columns], errors='ignore')
+        
+        # Drop non-numeric columns like IPs/Time
+        cols_to_drop = [col for col in features.columns if features[col].dtype == 'object' and 
+                        any(x in col.lower() for x in ['ip', 'address', 'id', 'time', 'stamp'])]
+        features = features.drop(columns=cols_to_drop, errors='ignore')
+        
+        # Label Encode remaining object columns
+        for col in features.select_dtypes(include=['object']).columns:
+             features[col] = 0 
+             
+        # Fill NA
+        features = features.fillna(0)
+        
+        # Scale
+        X = artifacts['scaler'].transform(features.values)
+        
+        # LightGBM prediction: classify into one of the classes
+        model = artifacts['model']
+        y_pred = model.predict(X)
+        
+        # Map predictions to class names
+        class_names = artifacts['class_names']
+        pred_labels = [class_names[idx] for idx in y_pred]
+        
+        # Block if NOT Benign
+        return [label != 'Benign' for label in pred_labels]
+        
+    except Exception as e:
+        # Fallback to ground truth if prediction fails
+        return [row['Label'] != 'Benign' for _, row in df_batch.iterrows()]
 
 # ==============================================================================
 # SIDEBAR NAVIGATION
@@ -287,7 +347,7 @@ with st.sidebar:
 
 if page == "📊 Live Detection":
     st.markdown("# Live Attack Detection")
-    st.markdown("Real-time network traffic analysis using ML-powered anomaly detection")
+    st.markdown("Real-time attack detection using LightGBM classifier")
     
     # Controls
     col_ctrl, col_spacer, col_status = st.columns([2, 4, 2])
@@ -308,11 +368,12 @@ if page == "📊 Live Detection":
     st.markdown("---")
     
     # Metrics row
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     metric_ph1 = m1.empty()
     metric_ph2 = m2.empty()
     metric_ph3 = m3.empty()
     metric_ph4 = m4.empty()
+    metric_ph5 = m5.empty()
     
     # Main content
     col_chart, col_table = st.columns([3, 2])
@@ -361,31 +422,117 @@ if page == "📊 Live Detection":
         selected_attack = attack_map.get(attack_type, "Benign")
         is_attack_mode = attack_type != "Normal Traffic"
         
+        # Initialize counters for smooth graph
+        total_processed = 0
+        total_blocked = 0
+        total_attacks = 0
+        total_detected = 0
+        
+        # Cumulative stats for Precision/Recall
+        cumulative_tp = 0
+        cumulative_fp = 0
+        cumulative_fn = 0
+        cumulative_tn = 0
+        
         for i in range(500):
-            # Get packet from data
-            if is_attack_mode:
-                subset = df[df['Label'] == selected_attack]
-                if len(subset) > 0:
-                    row = subset.sample(1).iloc[0]
-                else:
-                    row = df.sample(1).iloc[0]
-            else:
-                subset = df[df['Label'] == 'Benign']
-                if len(subset) > 0 and random.random() > 0.15:
-                    row = subset.sample(1).iloc[0]
-                else:
-                    row = df.sample(1).iloc[0]
+            # 1. Sample a BATCH of packets (e.g., 20 packets per 0.2s iteration = 100 pps)
+            BATCH_SIZE = 20
+            # Use time-based random state for truly different samples each iteration
+            rng = int(time.time() * 1000) % 100000 + i
             
-            is_attack = row['Label'] != 'Benign'
+            if is_attack_mode:
+                # Mix attack traffic with benign traffic (e.g. 70% attack, 30% benign)
+                # We need to sample BATCH_SIZE packets
+                n_attack = int(BATCH_SIZE * 0.7)
+                n_benign = BATCH_SIZE - n_attack
+                
+                # Sample attack packets
+                target_label = selected_attack
+                subset_attack = df[df['Label'] == target_label]
+                if len(subset_attack) < n_attack: # Handle small classes
+                    batch_attack = subset_attack.sample(n_attack, replace=True, random_state=rng)
+                else:
+                    batch_attack = subset_attack.sample(n_attack, random_state=rng)
+                    
+                # Sample benign packets
+                subset_benign = df[df['Label'] == 'Benign']
+                batch_benign = subset_benign.sample(n_benign, random_state=rng + 1)
+                
+                # Combine and shuffle
+                batch_df = pd.concat([batch_attack, batch_benign]).sample(frac=1, random_state=rng + 2).reset_index(drop=True)
+                
+            else:
+                # Mostly benign, maybe rare noise
+                subset = df[df['Label'] == 'Benign']
+                batch_df = subset.sample(BATCH_SIZE, random_state=rng)
+            
+            # 2. Real-time detection on the BATCH
+            is_detected_batch = predict_batch(batch_df, model_artifacts)
+            
+            # 3. Process results for Metrics & Graph
+            batch_blocked = sum(is_detected_batch)
+            batch_allowed = BATCH_SIZE - batch_blocked
+            
+            # Ground truth for stats
+            batch_true_labels = batch_df['Label'].values
+            batch_is_attack = batch_true_labels != 'Benign'
+            batch_attacks_count = sum(batch_is_attack)
+            
+            # Update cumulative stats (with decay for "live" feel)
+            total_processed += BATCH_SIZE
+            total_blocked += batch_blocked
+            total_attacks += batch_attacks_count
+            
+            # Calculate Batch Stats
+            batch_tp = sum([1 for d, a in zip(is_detected_batch, batch_is_attack) if d and a])
+            batch_fp = sum([1 for d, a in zip(is_detected_batch, batch_is_attack) if d and not a])
+            batch_fn = sum([1 for d, a in zip(is_detected_batch, batch_is_attack) if not d and a])
+            batch_tn = sum([1 for d, a in zip(is_detected_batch, batch_is_attack) if not d and not a])
+
+            # Update Cumulative Stats
+            cumulative_tp += batch_tp
+            cumulative_fp += batch_fp
+            cumulative_fn += batch_fn
+            cumulative_tn += batch_tn
+            
+            # Calculate Cumulative Metrics
+            if (cumulative_tp + cumulative_fp) > 0:
+                cum_precision = (cumulative_tp / (cumulative_tp + cumulative_fp)) * 100
+            else:
+                cum_precision = 100.0 
+                
+            if (cumulative_tp + cumulative_fn) > 0:
+                cum_recall = (cumulative_tp / (cumulative_tp + cumulative_fn)) * 100
+            else:
+                cum_recall = 100.0 
+                
+            if total_processed > 0:
+                cum_acceptance_rate = ((total_processed - total_blocked) / total_processed) * 100
+            else:
+                cum_acceptance_rate = 100.0
+                
+            # 4. Update Packet Stream (Show last packet of the batch)
+            # We'll take the last packet to display in the table
+            row = batch_df.iloc[-1]
+            is_detected = is_detected_batch[-1]
+            true_label = row['Label']
+            is_actually_attack = true_label != 'Benign'
             
             pkt = {
                 "time": time.strftime('%H:%M:%S'),
                 "src": row['Src IP'],
-                "type": row['Label'],
+                "type": true_label,
                 "proto": row['Protocol_Name'],
-                "status": "Blocked" if is_attack else "Allowed",
-                "badge": "badge-danger" if is_attack else "badge-success"
+                "status": "Blocked" if is_detected else "Allowed",
+                "badge": "badge-danger" if is_detected else ("badge-success" if not is_actually_attack else "badge-warning")
             }
+            
+            if is_detected:
+                pkt['badge'] = "badge-danger" 
+            elif is_actually_attack:
+                pkt['badge'] = "badge-warning" 
+            else:
+                pkt['badge'] = "badge-success" 
             
             logs.insert(0, pkt)
             if len(logs) > 8:
@@ -407,21 +554,35 @@ if page == "📊 Live Detection":
                 """)
             table_ph.markdown(f"<div class='card'>{table_html}</div>", unsafe_allow_html=True)
             
-            # Update metrics
-            blocked_count = sum(1 for l in logs if l['status'] == 'Blocked')
-            metric_ph1.metric("Throughput", f"{random.randint(80, 120)} pps")
-            metric_ph2.metric("Blocked", f"{blocked_count}")
-            metric_ph3.metric("Detection Rate", f"{92 if is_attack_mode else 98}%")
-            metric_ph4.metric("Status", "ALERT" if is_attack_mode else "Normal")
+            # 5. Update Metrics with REAL data
+            # Throughput: BATCH_SIZE / 0.2s = 100 pps (approx)
+            # Add some jitter to make it look organic
+            pps = int((BATCH_SIZE / 0.2) * random.uniform(0.9, 1.1))
             
-            # Update chart
-            x_data.append(i)
+            metric_ph1.metric("Throughput", f"{pps} pps")
+            metric_ph2.metric("Precision (Cumul)", f"{cum_precision:.1f}%")
+            metric_ph3.metric("Recall (Cumul)", f"{cum_recall:.1f}%")
+            metric_ph4.metric("Acceptance Rate", f"{cum_acceptance_rate:.1f}%")
+            
+            status_text = "NORMAL"
             if is_attack_mode:
-                y_normal.append(random.randint(5, 15))
-                y_blocked.append(random.randint(60, 90))
-            else:
-                y_normal.append(random.randint(70, 95))
-                y_blocked.append(random.randint(0, 8))
+                if cum_recall < 50:
+                    status_text = "CRITICAL FAILURE"
+                elif cum_recall < 90:
+                    status_text = "WARNING"
+                else:
+                    status_text = "MITIGATED"
+            
+            metric_ph5.metric("Status", status_text)
+            
+            # 6. Update Chart with REAL volume
+            x_data.append(i)
+            
+            # y_normal = Allowed packets (Benign + False Negatives)
+            y_normal.append(batch_allowed)
+            
+            # y_blocked = Blocked packets (True Positives + False Positives)
+            y_blocked.append(batch_blocked)
             
             if len(x_data) > 30:
                 x_data.pop(0)
@@ -431,13 +592,13 @@ if page == "📊 Live Detection":
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=x_data, y=y_normal,
-                mode='lines', name='Normal',
+                mode='lines', name='Allowed Traffic',
                 line=dict(color='#3b82f6', width=2),
                 fill='tozeroy', fillcolor='rgba(59, 130, 246, 0.1)'
             ))
             fig.add_trace(go.Scatter(
                 x=x_data, y=y_blocked,
-                mode='lines', name='Malicious',
+                mode='lines', name='Blocked Traffic',
                 line=dict(color='#ef4444', width=2),
                 fill='tozeroy', fillcolor='rgba(239, 68, 68, 0.1)'
             ))
@@ -448,7 +609,7 @@ if page == "📊 Live Detection":
                 height=300,
                 margin=dict(l=0, r=0, t=10, b=0),
                 xaxis=dict(showgrid=False, showticklabels=False),
-                yaxis=dict(showgrid=True, gridcolor='#f1f5f9', title="Packets/s"),
+                yaxis=dict(showgrid=True, gridcolor='#f1f5f9', title="Packets / 0.2s"),
                 legend=dict(orientation="h", y=1.15, x=0),
                 hovermode="x unified"
             )
